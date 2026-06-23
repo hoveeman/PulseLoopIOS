@@ -62,7 +62,7 @@ struct HealthSettingsSection: View {
                                 message: "PulseLoop is connected to Apple Health and can read and write your ring's data. Use “Sync workouts history” to push everything captured.")
         case .denied:
             alert = HealthAlert(title: "Apple Health Access Off",
-                                message: "Allow PulseLoop to read and write health data in Settings → Health → Data Access & Devices → PulseLoop.",
+                                message: "Allow PulseLoop to read and write health data in the Health app (under Sharing → Apps & Services) or in system Settings → Health → Data Access & Devices.",
                                 showSettings: true)
         case .notDetermined:
             Task {
@@ -75,7 +75,7 @@ struct HealthSettingsSection: View {
                                             message: "PulseLoop can now sync your ring data to Apple Health. Tap “Sync workouts history” to export everything captured.")
                     default:
                         alert = HealthAlert(title: "Apple Health",
-                                            message: "You can change PulseLoop's access anytime in Settings → Health → Data Access & Devices.",
+                                            message: "You can change PulseLoop's access anytime in the Health app (under Sharing → Apps & Services) or in system Settings → Health → Data Access & Devices.",
                                             showSettings: true)
                     }
                 } catch {
@@ -87,11 +87,11 @@ struct HealthSettingsSection: View {
 
     private func syncHistory() {
         Task {
-            await service.syncAll(context: modelContext)
+            await service.syncAll(context: modelContext, forceAll: true)
             refreshStatus()
             if service.authState == .denied {
                 alert = HealthAlert(title: "Apple Health Access Off",
-                                    message: "Allow PulseLoop to read and write health data in Settings → Health → Data Access & Devices → PulseLoop.",
+                                    message: "Allow PulseLoop to read and write health data in the Health app (under Sharing → Apps & Services) or in system Settings → Health → Data Access & Devices.",
                                     showSettings: true)
             }
         }
@@ -107,8 +107,12 @@ struct HealthSettingsSection: View {
     }
 
     private func openSettings() {
-        if let url = URL(string: UIApplication.openSettingsURLString) {
-            UIApplication.shared.open(url)
+        if let healthURL = URL(string: "x-apple-health://") {
+            UIApplication.shared.open(healthURL) { success in
+                if !success, let url = URL(string: UIApplication.openSettingsURLString) {
+                    UIApplication.shared.open(url)
+                }
+            }
         }
     }
 }

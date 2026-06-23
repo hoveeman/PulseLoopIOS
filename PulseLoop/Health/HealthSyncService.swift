@@ -21,6 +21,7 @@ final class HealthSyncService {
 
     private let store = HKHealthStore()
     private let log = Logger(subsystem: "com.pulseloop", category: "HealthSync")
+    private var pendingSyncTask: Task<Void, Never>?
 
     /// True while a sync is running (drives the Settings button state).
     var isSyncing = false
@@ -80,7 +81,7 @@ final class HealthSyncService {
     /// Exports all captured data to Apple Health. Returns a short status string and
     /// also publishes it via `lastResult`.
     @discardableResult
-    func syncAll(context: ModelContext) async -> String {
+    func syncAll(context: ModelContext, forceAll: Bool = false) async -> String {
         guard isAvailable else {
             let msg = "Apple Health isn't available on this device."
             lastResult = msg
@@ -88,6 +89,10 @@ final class HealthSyncService {
         }
         isSyncing = true
         defer { isSyncing = false }
+
+        if forceAll {
+            resetSyncStatus(context: context)
+        }
 
         // Make sure we have permission (no-op once the user has answered the prompt).
         do {
@@ -108,16 +113,16 @@ final class HealthSyncService {
         let finishedSessions = ActivityRepository.sessions(context: context)
             .filter { $0.status == .finished && $0.endedAt != nil }
 
-        // Phase 1 — clear everything we wrote previously (idempotent re-sync).
-        await deleteAllManaged()
-
-        // Phase 2 — write the current state.
+        // Phase 1 — incremental sync of unsynced state.
         var counts = SyncCounts()
         do {
             try await syncMeasurements(context: context, counts: &counts)
             try await syncDailyActivity(sessions: finishedSessions, context: context, counts: &counts)
             try await syncSleep(context: context, counts: &counts)
-            try await syncWorkouts(sessions: finishedSessions, context: context, counts: &counts)
+            
+            let unsyncedSessions = ActivityRepository.unsyncedSessions(context: context)
+                .filter { $0.status == .finished && $0.endedAt != nil }
+            try await syncWorkouts(sessions: unsyncedSessions, context: context, counts: &counts)
         } catch {
             log.error("Health sync failed: \(error.localizedDescription)")
             let msg = "Synced with errors: \(error.localizedDescription)"
@@ -130,13 +135,77 @@ final class HealthSyncService {
         return msg
     }
 
+    /// Schedules a debounced sync of all data to Apple Health.
+    /// If another sync is requested before the debounce delay expires, the previous request is cancelled.
+    func triggerAutomaticSync(context: ModelContext, delaySeconds: TimeInterval = 15) {
+        #if DEBUG
+        if NSClassFromString("XCTestCase") != nil || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
+            return
+        }
+        #endif
+        
+        guard authState == .authorized else { return }
+        
+        pendingSyncTask?.cancel()
+        pendingSyncTask = Task {
+            do {
+                try await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
+                _ = await syncAll(context: context)
+            } catch {
+                // Cancelled
+            }
+        }
+    }
+
     // MARK: - Vitals (heart rate, SpO₂, HRV, temperature)
 
     private func syncMeasurements(context: ModelContext, counts: inout SyncCounts) async throws {
+        // 1. Deduplicate local SwiftData measurements first to resolve any existing duplicate rows.
+        let allMeasurements = MetricsRepository.measurements(context: context)
+        var grouped: [String: [Measurement]] = [:]
+        for m in allMeasurements {
+            let key = "\(m.kindRaw)-\(m.timestamp.timeIntervalSince1970)"
+            grouped[key, default: []].append(m)
+        }
+        
+        var uuidsToDeleteFromHealth: [String] = []
+        var localDeletedCount = 0
+        
+        for (_, list) in grouped where list.count > 1 {
+            // Keep one: prefer one that is already synced, or just the first one
+            let sorted = list.sorted { (m1, m2) -> Bool in
+                if m1.syncedAt != nil && m2.syncedAt == nil { return true }
+                if m1.syncedAt == nil && m2.syncedAt != nil { return false }
+                return m1.id.uuidString < m2.id.uuidString
+            }
+            let toKeep = sorted[0]
+            let toDelete = sorted.suffix(from: 1)
+            
+            for m in toDelete {
+                uuidsToDeleteFromHealth.append(m.id.uuidString)
+                context.delete(m)
+                localDeletedCount += 1
+            }
+        }
+        
+        if localDeletedCount > 0 {
+            try? context.save()
+            log.info("Deduplicated \(localDeletedCount) duplicate measurements locally.")
+        }
+        
+        if !uuidsToDeleteFromHealth.isEmpty {
+            await deleteByExternalUUIDs(uuidsToDeleteFromHealth)
+            log.info("Requested deletion of \(uuidsToDeleteFromHealth.count) duplicate measurements from Apple Health.")
+        }
+
         // Skip seeded/demo rows so we never push synthetic data into Health.
-        let measurements = MetricsRepository.measurements(context: context)
+        let measurements = MetricsRepository.unsyncedMeasurements(context: context)
             .filter { $0.sourceRaw != MeasurementSource.mock.rawValue }
         guard !measurements.isEmpty else { return }
+
+        // Delete from Health first before writing to avoid any chance of duplication
+        let externalUUIDs = measurements.map { $0.id.uuidString }
+        await deleteByExternalUUIDs(externalUUIDs)
 
         var byType: [HKQuantityType: [HKQuantitySample]] = [:]
         for m in measurements {
@@ -157,12 +226,24 @@ final class HealthSyncService {
             try await save(samples)
             counts.measurements += samples.count
         }
+        
+        for m in measurements {
+            if let mapping = Self.quantityMapping(for: m.kind) {
+                if canShare(mapping.type) {
+                    m.syncedAt = Date()
+                }
+            } else {
+                m.syncedAt = Date()
+            }
+        }
+        try? context.save()
     }
+
 
     // MARK: - Daily activity (steps, active energy, distance)
 
     private func syncDailyActivity(sessions: [ActivitySession], context: ModelContext, counts: inout SyncCounts) async throws {
-        let rows = MetricsRepository.activityRows(context: context).filter { $0.source != "mock" }
+        let rows = MetricsRepository.unsyncedActivityRows(context: context).filter { $0.source != "mock" }
         guard !rows.isEmpty else { return }
         let cal = Calendar.current
 
@@ -220,9 +301,23 @@ final class HealthSyncService {
             }
         }
 
+        let externalUUIDs = rows.flatMap { ["steps-\($0.id.uuidString)", "energy-\($0.id.uuidString)", "distance-\($0.id.uuidString)"] }
+        await deleteByExternalUUIDs(externalUUIDs)
+
         for samples in [steps, energy, distance] where !samples.isEmpty {
             try await save(samples)
             counts.dailyMetrics += samples.count
+        }
+        
+        let stepAuthorized = stepType.map { canShare($0) } ?? true
+        let energyAuthorized = energyType.map { canShare($0) } ?? true
+        let distAuthorized = distType.map { canShare($0) } ?? true
+        
+        if stepAuthorized && energyAuthorized && distAuthorized {
+            for row in rows {
+                row.syncedAt = Date()
+            }
+            try? context.save()
         }
     }
 
@@ -230,7 +325,7 @@ final class HealthSyncService {
 
     private func syncSleep(context: ModelContext, counts: inout SyncCounts) async throws {
         guard let sleepType = HKObjectType.categoryType(forIdentifier: .sleepAnalysis), canShare(sleepType) else { return }
-        let sessions = SleepRepository.sessions(context: context)
+        let sessions = SleepRepository.unsyncedSessions(context: context)
         guard !sessions.isEmpty else { return }
 
         var samples: [HKCategorySample] = []
@@ -255,26 +350,42 @@ final class HealthSyncService {
                     metadata: [HKMetadataKeyExternalUUID: "sleepblock-\(block.id.uuidString)"]))
             }
         }
+        let externalUUIDs = sessions.map { "sleep-\($0.id.uuidString)" } + sessions.flatMap { session in
+            SleepRepository.blocks(sessionId: session.id, context: context).map { "sleepblock-\($0.id.uuidString)" }
+        }
+        await deleteByExternalUUIDs(externalUUIDs)
+
         guard !samples.isEmpty else { return }
         try await save(samples)
         counts.sleep = samples.count
+        
+        for session in sessions {
+            session.syncedAt = Date()
+        }
+        try? context.save()
     }
 
     // MARK: - Workouts (+ HR association by time + GPS route)
 
     private func syncWorkouts(sessions: [ActivitySession], context: ModelContext, counts: inout SyncCounts) async throws {
         guard canShare(HKObjectType.workoutType()), !sessions.isEmpty else { return }
+        
+        let uuids = sessions.map { $0.id.uuidString }
+        await deleteByExternalUUIDs(uuids)
+        
         var saved = 0
         for session in sessions {
             guard let end = session.endedAt, end > session.startedAt else { continue }
             do {
                 try await buildWorkout(session: session, end: end, context: context)
+                session.syncedAt = Date()
                 saved += 1
             } catch {
                 log.error("Workout \(session.id.uuidString) sync failed: \(error.localizedDescription)")
             }
         }
         counts.workouts = saved
+        try? context.save()
     }
 
     private func buildWorkout(session: ActivitySession, end: Date, context: ModelContext) async throws {
@@ -338,32 +449,38 @@ final class HealthSyncService {
         do {
             try await store.save(objects)
         } catch {
+            log.error("Batch save failed, falling back to per-object. Error: \(error.localizedDescription)")
             // A single duplicate (same external UUID) fails the whole batch; fall
             // back to per-object saves so the rest still land.
-            for object in objects { try? await store.save([object]) }
-        }
-    }
-
-    /// Best-effort deletion of every object this app previously wrote, so a re-sync
-    /// replaces rather than duplicates.
-    private func deleteAllManaged() async {
-        var types: [HKSampleType] = quantityWriteTypes
-        if let sleep = HKObjectType.categoryType(forIdentifier: .sleepAnalysis) { types.append(sleep) }
-        types.append(HKObjectType.workoutType())
-        types.append(HKSeriesType.workoutRoute())
-        for type in types where canShare(type) {
-            await deleteOurSamples(of: type)
-        }
-    }
-
-    private func deleteOurSamples(of type: HKSampleType) async {
-        let predicate = HKQuery.predicateForObjects(from: HKSource.default())
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            store.deleteObjects(of: type, predicate: predicate) { _, _, error in
-                if let error {
-                    self.log.error("Delete \(type.identifier) failed: \(error.localizedDescription)")
+            for object in objects {
+                do {
+                    try await store.save([object])
+                } catch {
+                    log.error("Failed to save object \(object): \(error.localizedDescription)")
                 }
-                cont.resume()
+            }
+        }
+    }
+
+    private func deleteByExternalUUIDs(_ uuids: [String]) async {
+        guard !uuids.isEmpty else { return }
+        let metaPredicate = HKQuery.predicateForObjects(withMetadataKey: HKMetadataKeyExternalUUID, allowedValues: uuids)
+        let sourcePredicate = HKQuery.predicateForObjects(from: HKSource.default())
+        let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [sourcePredicate, metaPredicate])
+        let allTypes = shareTypes.filter { $0 is HKQuantityType || $0 is HKCategoryType || $0 is HKWorkoutType }
+        
+        await withTaskGroup(of: Void.self) { group in
+            for type in allTypes where canShare(type) {
+                group.addTask {
+                    await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                        self.store.deleteObjects(of: type, predicate: predicate) { success, count, error in
+                            if let error {
+                                self.log.error("deleteObjects failed for \(type.identifier): \(error.localizedDescription)")
+                            }
+                            cont.resume()
+                        }
+                    }
+                }
             }
         }
     }
@@ -450,6 +567,27 @@ final class HealthSyncService {
             guard !parts.isEmpty else { return "Nothing to sync yet." }
             return "Synced " + parts.joined(separator: ", ") + " to Apple Health."
         }
+    }
+
+    private func resetSyncStatus(context: ModelContext) {
+        log.info("Resetting Apple Health sync status for all local records to force full re-sync.")
+        let measurements = (try? context.fetch(FetchDescriptor<Measurement>())) ?? []
+        for m in measurements {
+            m.syncedAt = nil
+        }
+        let activities = (try? context.fetch(FetchDescriptor<ActivityDaily>())) ?? []
+        for a in activities {
+            a.syncedAt = nil
+        }
+        let sleep = (try? context.fetch(FetchDescriptor<SleepSession>())) ?? []
+        for s in sleep {
+            s.syncedAt = nil
+        }
+        let workouts = (try? context.fetch(FetchDescriptor<ActivitySession>())) ?? []
+        for w in workouts {
+            w.syncedAt = nil
+        }
+        try? context.save()
     }
 }
 
