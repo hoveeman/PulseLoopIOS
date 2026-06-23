@@ -71,7 +71,11 @@ final class CoachNotificationServiceTests: XCTestCase {
 
     func testForceGeneratesRecordsAndWritesThread() async throws {
         let c = try TestSupport.makeContext()
-        let outcome = await service(c).runDueSlot(force: true)
+        
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        let morningTime = cal.date(bySettingHour: 9, minute: 0, second: 0, of: today)!
+        let outcome = await service(c).runDueSlot(force: true, now: morningTime)
         if case .sent = outcome {} else { XCTFail("expected sent, got \(outcome)") }
 
         // A record exists + a fresh per-notification conversation was created.
