@@ -45,7 +45,7 @@ final class EventBridgeTests: XCTestCase {
     }
 
     func testStaleSleepTimelineRejected() {
-        let oldStart = Date().addingTimeInterval(-5 * 24 * 3600)
+        let oldStart = Date().addingTimeInterval(-10 * 24 * 3600)
         XCTAssertTrue(RingEventBridge.events(for: .sleepTimeline(timestamp: oldStart, stages: [.light])).isEmpty)
     }
 

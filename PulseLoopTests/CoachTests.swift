@@ -205,6 +205,12 @@ final class CoachToolTests: XCTestCase {
 final class CoachOrchestratorTests: XCTestCase {
     private func packet(_ c: ModelContext) -> CoachContextPacket { CoachContextBuilder.build(context: c) }
 
+    private func enabledFlags() -> CoachFeatureFlags {
+        var settings = CoachSettings.default
+        settings.coachMasterEnabled = true
+        return CoachFeatureFlags(settings: settings, hasAPIKey: true)
+    }
+
     private func orchestrator(client: ResponsesClient, flags: CoachFeatureFlags, context: ModelContext) -> CoachOrchestrator {
         CoachOrchestrator(client: client, registry: ToolRegistry(flags: flags), flags: flags,
                           toolContext: ToolExecutionContext(modelContext: context, flags: flags))
@@ -222,7 +228,7 @@ final class CoachOrchestratorTests: XCTestCase {
 
     func testMessageOnlyResponseIsParsed() async throws {
         let c = try TestSupport.makeContext()
-        let flags = CoachFeatureFlags(settings: .default, hasAPIKey: true)
+        let flags = enabledFlags()
         let stub = StubResponsesClient([OpenAIResponse(id: "r1", outputItems: [.message(text: validResponseJSON(title: "Hi"))])])
         let o = orchestrator(client: stub, flags: flags, context: c)
         let result = await o.runTurn(userText: "hi", packet: packet(c), recentMessages: [])
@@ -234,7 +240,7 @@ final class CoachOrchestratorTests: XCTestCase {
         let c = try TestSupport.makeContext()
         TestSupport.insertActivity(date: Date(), steps: 8200, into: c)
         let today = CoachDataAccess.localDateString(Date())
-        let flags = CoachFeatureFlags(settings: .default, hasAPIKey: true)
+        let flags = enabledFlags()
         let stub = StubResponsesClient([
             OpenAIResponse(id: "r1", outputItems: [.functionCall(.init(name: "get_daily_summary", callID: "c1", arguments: #"{"date":"\#(today)"}"#))]),
             OpenAIResponse(id: "r2", outputItems: [.message(text: validResponseJSON())]),
@@ -250,7 +256,7 @@ final class CoachOrchestratorTests: XCTestCase {
 
     func testUnparseableFinalFallsBack() async throws {
         let c = try TestSupport.makeContext()
-        let flags = CoachFeatureFlags(settings: .default, hasAPIKey: true)
+        let flags = enabledFlags()
         // Every response is junk → repair loop exhausts → fallback.
         let junk = OpenAIResponse(id: "x", outputItems: [.message(text: "not json")])
         let o = orchestrator(client: StubResponsesClient([junk, junk, junk, junk]), flags: flags, context: c)

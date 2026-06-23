@@ -166,6 +166,12 @@ final class GeminiClient: ResponsesClient, @unchecked Sendable {
         out.removeValue(forKey: "additionalProperties")
         out.removeValue(forKey: "$schema")
         out.removeValue(forKey: "strict")
+        out.removeValue(forKey: "maxLength")
+        out.removeValue(forKey: "minLength")
+        out.removeValue(forKey: "maxItems")
+        out.removeValue(forKey: "minItems")
+        out.removeValue(forKey: "pattern")
+        out.removeValue(forKey: "format")
 
         // Gemini uses `nullable: true` rather than JSON Schema union types.
         if let types = out["type"] as? [String] {

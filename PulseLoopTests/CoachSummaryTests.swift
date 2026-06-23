@@ -33,6 +33,7 @@ final class CoachSummaryContentTests: XCTestCase {
 final class CoachSummaryServiceTests: XCTestCase {
     private func service(_ c: ModelContext, key: String? = "sk-test", json: String = summaryJSON()) -> CoachSummaryService {
         let store = CoachSettingsStore(defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        store.settings.coachMasterEnabled = true
         return CoachSummaryService(
             modelContext: c,
             keyStore: SummaryStubKeyStore(key: key),
