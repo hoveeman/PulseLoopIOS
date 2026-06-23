@@ -84,4 +84,40 @@ final class SleepServiceTests: XCTestCase {
         XCTAssertEqual(SleepService.dayReferenceNight(now: at3am), yesterday, "before 4 AM, still last night")
         XCTAssertEqual(SleepService.dayReferenceNight(now: at4am), today, "from 4 AM, flip to today")
     }
+
+    func testCrossMidnightSleepMerging() throws {
+        let context = try TestSupport.makeContext()
+        
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        let yesterday = cal.date(byAdding: .day, value: -1, to: today)!
+        
+        // Use the subscriber directly to persist the sleep timeline packets synchronously:
+        let subscriber = EventPersistenceSubscriber(context: context)
+        
+        // 1. A packet starting at 11:30 PM yesterday (June 22)
+        let start1 = cal.date(bySettingHour: 23, minute: 30, second: 0, of: yesterday)!
+        subscriber.persist(.sleepTimeline(timestamp: start1, stages: Array(repeating: SleepStage.light, count: 15)))
+        
+        // 2. A packet starting at 12:15 AM today (June 23)
+        let start2 = cal.date(bySettingHour: 0, minute: 15, second: 0, of: today)!
+        subscriber.persist(.sleepTimeline(timestamp: start2, stages: Array(repeating: SleepStage.deep, count: 15)))
+        
+        // There should be only ONE unified session for today
+        let sessions = SleepRepository.sessions(context: context)
+        XCTAssertEqual(sessions.count, 1)
+        
+        guard let session = sessions.first else {
+            XCTFail("No session was created")
+            return
+        }
+        
+        // Verify that the session is dated today (waking morning)
+        XCTAssertEqual(cal.startOfDay(for: session.date), today)
+        
+        // Check that blocks from both packets are present
+        let blocks = SleepRepository.blocks(sessionId: session.id, context: context)
+        XCTAssertTrue(blocks.contains { $0.startAt == start1 })
+        XCTAssertTrue(blocks.contains { $0.startAt == start2 })
+    }
 }
