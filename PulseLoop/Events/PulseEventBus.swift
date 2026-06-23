@@ -1,5 +1,8 @@
 import Foundation
 import SwiftData
+#if canImport(UIKit)
+import UIKit
+#endif
 
 enum PulseEvent: Sendable {
     case deviceStateChanged(state: RingConnectionState, address: String?)
@@ -91,6 +94,20 @@ final class EventPersistenceSubscriber {
     }
     
     func persist(_ event: PulseEvent) {
+        #if canImport(UIKit)
+        let bgTask = UIApplication.shared.beginBackgroundTask(withName: "PulseEventPersistence") {
+            // Task expired
+        }
+        #endif
+
+        defer {
+            #if canImport(UIKit)
+            if bgTask != .invalid {
+                UIApplication.shared.endBackgroundTask(bgTask)
+            }
+            #endif
+        }
+
         switch event {
         case let .deviceStateChanged(state, address):
             let device = MetricsService.fetchDevices(context).first ?? Device()

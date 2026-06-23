@@ -1,5 +1,8 @@
 import Foundation
 import SwiftData
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// Subscribes to `PulseEventBus` and records high-level connection / sync / battery / error events
 /// into the structured `WearableLog` store. Mirrors the wiring of `EventPersistenceSubscriber`
@@ -53,6 +56,20 @@ final class DiagnosticsSubscriber {
     }
 
     private func log(_ category: WearableLogCategory, _ level: WearableLogLevel, _ message: String, metadata: [String: String]? = nil) {
+        #if canImport(UIKit)
+        let bgTask = UIApplication.shared.beginBackgroundTask(withName: "DiagnosticsLog") {
+            // Task expired
+        }
+        #endif
+
+        defer {
+            #if canImport(UIKit)
+            if bgTask != .invalid {
+                UIApplication.shared.endBackgroundTask(bgTask)
+            }
+            #endif
+        }
+
         let json = metadata.flatMap { dict -> String? in
             guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return nil }
             return String(data: data, encoding: .utf8)

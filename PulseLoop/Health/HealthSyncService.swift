@@ -3,6 +3,9 @@ import HealthKit
 import CoreLocation
 import SwiftData
 import os
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// Mirrors everything the ring captures into Apple Health and requests read/write
 /// access for those types:
@@ -212,7 +215,19 @@ final class HealthSyncService {
         pendingSyncTask = Task {
             do {
                 try await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
+                #if canImport(UIKit)
+                let bgTask = await UIApplication.shared.beginBackgroundTask(withName: "HealthSyncAll") {
+                    // Task expired
+                }
+                #endif
+                
                 _ = await syncAll(context: context)
+                
+                #if canImport(UIKit)
+                if bgTask != .invalid {
+                    await UIApplication.shared.endBackgroundTask(bgTask)
+                }
+                #endif
             } catch {
                 // Cancelled
             }
