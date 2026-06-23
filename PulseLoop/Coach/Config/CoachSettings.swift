@@ -23,8 +23,9 @@ enum CoachProviderMode: String, Codable, CaseIterable, Identifiable {
 
 /// Preset Gemini model choices surfaced in Settings.
 enum GeminiModel: String, CaseIterable, Identifiable {
+    case flash35 = "gemini-3.5-flash"
+    case pro31   = "gemini-3.1-pro-preview"
     case flash25 = "gemini-2.5-flash"
-    case flash20 = "gemini-2.0-flash"
     case pro25   = "gemini-2.5-pro"
 
     var id: String { rawValue }
@@ -33,9 +34,10 @@ enum GeminiModel: String, CaseIterable, Identifiable {
 
     var blurb: String {
         switch self {
-        case .flash25: return "Fast & capable (default)"
-        case .flash20: return "Previous generation"
-        case .pro25:   return "Best reasoning"
+        case .flash35: return "Newest, most capable (default)"
+        case .pro31:   return "Advanced reasoning (preview)"
+        case .flash25: return "Fast & capable"
+        case .pro25:   return "Deep reasoning (2.5)"
         }
     }
 }
@@ -88,6 +90,11 @@ struct CoachSettings: Codable, Equatable {
     var notificationsEnabled: Bool = false
     var morningHour: Int = 8
     var eveningHour: Int = 19
+
+    /// The Gemini model to use, validated against the known presets. Falls back to
+    /// the default (`gemini-3.5-flash`) when the stored `model` isn't a recognized
+    /// Gemini model (e.g. a value left over from another provider).
+    var geminiModel: String { GeminiModel(rawValue: model)?.rawValue ?? GeminiModel.flash35.rawValue }
 
     static let `default` = CoachSettings()
 

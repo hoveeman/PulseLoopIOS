@@ -241,7 +241,7 @@ struct CoachSettingsSection: View {
                 // Reset model to the default for the selected provider.
                 switch newProvider {
                 case .userGeminiKey:
-                    store.settings.model = GeminiModel.flash25.rawValue
+                    store.settings.model = GeminiModel.flash35.rawValue
                 default:
                     store.settings.model = CoachModel.gpt54.rawValue
                 }

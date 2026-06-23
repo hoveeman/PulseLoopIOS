@@ -24,7 +24,7 @@ final class GeminiClient: ResponsesClient, @unchecked Sendable {
     // Maps generated call IDs → function names (Gemini uses name, not call_id).
     private var callIdToName: [String: String] = [:]
 
-    init(apiKey: String, model: String = "gemini-2.5-flash", session: URLSession = .shared) {
+    init(apiKey: String, model: String = "gemini-3.5-flash", session: URLSession = .shared) {
         self.apiKey = apiKey
         self.model = model
         self.session = session

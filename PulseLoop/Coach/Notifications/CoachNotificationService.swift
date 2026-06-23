@@ -93,7 +93,7 @@ final class CoachNotificationService {
         switch settingsStore.settings.providerMode {
         case .userGeminiKey:
             let key = (try? geminiKeyStore.readKey()) ?? nil
-            return (key, GeminiClient(apiKey: key ?? ""))
+            return (key, GeminiClient(apiKey: key ?? "", model: settingsStore.settings.geminiModel))
         default:
             let key = (try? keyStore.readKey()) ?? nil
             return (key, clientFactory(key ?? ""))
