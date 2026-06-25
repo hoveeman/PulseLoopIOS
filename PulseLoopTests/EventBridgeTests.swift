@@ -45,6 +45,8 @@ final class EventBridgeTests: XCTestCase {
     }
 
     func testStaleSleepTimelineRejected() {
+        // The plausibility window is ~8 days (matches the Colmi multi-night history horizon),
+        // so a timestamp well outside it indicates a misdecoded frame and must be dropped.
         let oldStart = Date().addingTimeInterval(-10 * 24 * 3600)
         XCTAssertTrue(RingEventBridge.events(for: .sleepTimeline(timestamp: oldStart, stages: [.light])).isEmpty)
     }

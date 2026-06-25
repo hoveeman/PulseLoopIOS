@@ -71,11 +71,10 @@ final class CoachNotificationServiceTests: XCTestCase {
 
     func testForceGeneratesRecordsAndWritesThread() async throws {
         let c = try TestSupport.makeContext()
-        
-        let cal = Calendar.current
-        let today = cal.startOfDay(for: Date())
-        let morningTime = cal.date(bySettingHour: 9, minute: 0, second: 0, of: today)!
-        let outcome = await service(c).runDueSlot(force: true, now: morningTime)
+        // Pin `now` to a morning hour: a forced run picks its slot from the wall clock
+        // (< 14:00 → morning), and this test asserts the "Good morning" copy.
+        let morning = Calendar.current.date(bySettingHour: 8, minute: 0, second: 0, of: Date()) ?? Date()
+        let outcome = await service(c).runDueSlot(force: true, now: morning)
         if case .sent = outcome {} else { XCTFail("expected sent, got \(outcome)") }
 
         // A record exists + a fresh per-notification conversation was created.
