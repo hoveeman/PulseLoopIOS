@@ -40,7 +40,6 @@ final class OpenRouterClient: ResponsesClient, @unchecked Sendable {
 
         let input = req["input"] as? [[String: Any]] ?? []
         let tools = req["tools"] as? [[String: Any]] ?? []
-        let textFormat = (req["text"] as? [String: Any])?["format"] as? [String: Any]
         let previousResponseId = req["previous_response_id"] as? String
         // OpenRouter accepts the same unified `reasoning` object the app already
         // builds (`{ "effort": "low|medium|high" }`); it's ignored for models that
@@ -53,7 +52,7 @@ final class OpenRouterClient: ResponsesClient, @unchecked Sendable {
             appendContinuation(previousId: previousResponseId!, input: input)
         }
 
-        let body = buildChatBody(tools: convertTools(tools), textFormat: textFormat, reasoning: reasoning)
+        let body = buildChatBody(tools: convertTools(tools), reasoning: reasoning)
         let bodyData = try JSONSerialization.data(withJSONObject: body, options: [.withoutEscapingSlashes])
 
         var request = URLRequest(url: endpoint)
@@ -142,38 +141,55 @@ final class OpenRouterClient: ResponsesClient, @unchecked Sendable {
 
     // MARK: - Build request body
 
-    private func buildChatBody(tools: [[String: Any]], textFormat: [String: Any]?, reasoning: Any?) -> [String: Any] {
-        var body: [String: Any] = ["model": model, "messages": messages]
+    private func buildChatBody(tools: [[String: Any]], reasoning: Any?) -> [String: Any] {
+        var body: [String: Any] = ["model": model, "messages": cacheControlledMessages()]
 
         if !tools.isEmpty {
-            body["tools"] = tools
+            // Cache the (large, static) tool block — re-sent on every round and
+            // identical across questions. A breakpoint on the last tool caches the
+            // whole tools prefix on providers that support it (Anthropic, etc.);
+            // OpenRouter strips `cache_control` for providers that don't.
+            var cachedTools = tools
+            cachedTools[cachedTools.count - 1]["cache_control"] = ["type": "ephemeral"]
+            body["tools"] = cachedTools
         }
 
-        // Like the Gemini adapter, only constrain output to a JSON schema on
-        // tool-less turns: combining tools with a strict `response_format` isn't
-        // reliably supported across OpenRouter's whole model catalog. When tools are
-        // present the model either calls a function or replies in prose, and the
-        // orchestrator's tool-less repair turn then enforces the schema. (A
-        // `json_schema` response_format only works on OpenRouter models that support
-        // structured outputs; the orchestrator's JSON-repair loop covers the rest.)
-        if tools.isEmpty, let fmt = textFormat {
-            let fmtType = fmt["type"] as? String ?? ""
-            if fmtType == "json_schema" {
-                // Responses puts name/schema/strict as siblings of `type`; Chat
-                // Completions nests them under `json_schema`.
-                var jsonSchema: [String: Any] = [:]
-                if let name = fmt["name"] as? String { jsonSchema["name"] = name }
-                if let schema = fmt["schema"] as? [String: Any] { jsonSchema["schema"] = schema }
-                if let strict = fmt["strict"] as? Bool { jsonSchema["strict"] = strict }
-                body["response_format"] = ["type": "json_schema", "json_schema": jsonSchema]
-            } else if fmtType == "json_object" {
-                body["response_format"] = ["type": "json_object"]
-            }
-        }
+        // Deliberately NO `response_format`. OpenAI-style `json_schema` (and even
+        // `json_object`) isn't reliably accepted across OpenRouter's catalog — in
+        // particular Anthropic rejects this app's OpenAI-shaped coach_response schema
+        // (maxLength / maxItems / union-null types its structured outputs don't
+        // support), which broke the tool-less repair turn. The system prompt already
+        // demands the coach_response JSON and the orchestrator runs a 3-attempt JSON
+        // repair loop, so we let the model comply via the prompt instead.
 
         if let reasoning { body["reasoning"] = reasoning }
 
         return body
+    }
+
+    // MARK: - Prompt caching
+
+    /// Returns `messages` with Anthropic-style `cache_control` breakpoints on the
+    /// system messages so the large static prefix isn't re-billed at full price on
+    /// every tool-loop round / question. The first system message (the static coach
+    /// system prompt) caches cross-question; the last (the per-question data context)
+    /// caches across this question's rounds. `cache_control` is ignored by providers
+    /// that don't support it.
+    private func cacheControlledMessages() -> [[String: Any]] {
+        var out = messages
+        let systemIdxs = out.indices.filter { (out[$0]["role"] as? String) == "system" }
+        if let first = systemIdxs.first { out[first] = withCacheControl(out[first]) }
+        if let last = systemIdxs.last, last != systemIdxs.first { out[last] = withCacheControl(out[last]) }
+        return out
+    }
+
+    /// Converts a string-content message into the Chat Completions content-array
+    /// form carrying a `cache_control` breakpoint.
+    private func withCacheControl(_ message: [String: Any]) -> [String: Any] {
+        guard let text = message["content"] as? String else { return message }
+        var m = message
+        m["content"] = [["type": "text", "text": text, "cache_control": ["type": "ephemeral"]]]
+        return m
     }
 
     // MARK: - Parse Chat Completions response → OpenAIResponse
