@@ -11,6 +11,10 @@ struct CoachSettingsSection: View {
     @State private var store = CoachSettingsStore.shared
     private let openAIKeyStore = OpenAIKeychainStore()
     private let geminiKeyStore = GeminiKeychainStore()
+    private let openRouterKeyStore = OpenRouterKeychainStore()
+
+    /// Picker tag that selects the free-text "Custom" OpenRouter model entry.
+    private let customModelTag = "__custom__"
 
     // OpenAI key state
     @State private var keyDraft: String = ""
@@ -24,9 +28,26 @@ struct CoachSettingsSection: View {
     @State private var showGeminiKey: Bool = false
     @State private var geminiKeyError: String?
 
+    // OpenRouter key state
+    @State private var openRouterKeyDraft: String = ""
+    @State private var hasOpenRouterKey: Bool = false
+    @State private var showOpenRouterKey: Bool = false
+    @State private var openRouterKeyError: String?
+
     private var flags: CoachFeatureFlags {
-        let hasKey = store.settings.providerMode == .userGeminiKey ? hasGeminiKey : hasSavedKey
+        let hasKey: Bool
+        switch store.settings.providerMode {
+        case .userGeminiKey: hasKey = hasGeminiKey
+        case .userOpenRouterKey: hasKey = hasOpenRouterKey
+        default: hasKey = hasSavedKey
+        }
         return CoachFeatureFlags(settings: store.settings, hasAPIKey: hasKey)
+    }
+
+    /// True when the stored OpenRouter model isn't one of the curated presets
+    /// (i.e. the user is using the free-text "Custom" slug).
+    private var isCustomOpenRouterModel: Bool {
+        !OpenRouterModel.allCases.contains { $0.rawValue == store.settings.model }
     }
 
     var body: some View {
@@ -46,12 +67,18 @@ struct CoachSettingsSection: View {
             }
 
             labeledRow("Model") {
-                Picker("Model", selection: modelBinding) {
-                    if store.settings.providerMode == .userGeminiKey {
+                Picker("Model", selection: modelPickerBinding) {
+                    switch store.settings.providerMode {
+                    case .userGeminiKey:
                         ForEach(GeminiModel.allCases) { model in
                             Text(model.label).tag(model.rawValue)
                         }
-                    } else {
+                    case .userOpenRouterKey:
+                        ForEach(OpenRouterModel.allCases) { model in
+                            Text(model.label).tag(model.rawValue)
+                        }
+                        Text("Custom…").tag(customModelTag)
+                    default:
                         ForEach(CoachModel.allCases) { model in
                             Text(model.label).tag(model.rawValue)
                         }
@@ -59,6 +86,10 @@ struct CoachSettingsSection: View {
                 }
                 .pickerStyle(.menu)
                 .tint(PulseColors.accent)
+            }
+
+            if store.settings.providerMode == .userOpenRouterKey, isCustomOpenRouterModel {
+                customModelField
             }
 
             if store.settings.providerMode == .userOpenAIKey {
@@ -82,6 +113,17 @@ struct CoachSettingsSection: View {
                     error: geminiKeyError,
                     onSave: saveGeminiKey,
                     onRemove: removeGeminiKey
+                )
+            } else if store.settings.providerMode == .userOpenRouterKey {
+                apiKeyField(
+                    placeholder: "sk-or-v1-…",
+                    hint: "Stored only in your device Keychain. Used to call OpenRouter directly.",
+                    draft: $openRouterKeyDraft,
+                    showRaw: $showOpenRouterKey,
+                    hasSaved: hasOpenRouterKey,
+                    error: openRouterKeyError,
+                    onSave: saveOpenRouterKey,
+                    onRemove: removeOpenRouterKey
                 )
             }
 
@@ -186,6 +228,29 @@ struct CoachSettingsSection: View {
         .onAppear(perform: refreshKeyState)
     }
 
+    // MARK: - Custom OpenRouter model field
+
+    private var customModelField: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            TextField("vendor/model-slug", text: modelBinding)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .font(.system(size: 14).monospaced())
+                .foregroundStyle(PulseColors.textPrimary)
+                .padding(.horizontal, 14).padding(.vertical, 10)
+                .background(PulseColors.cardSoft, in: Capsule())
+                .overlay(Capsule().stroke(PulseColors.borderSubtle, lineWidth: 1))
+
+            Text("Any model slug from openrouter.ai/models — e.g. anthropic/claude-sonnet-4.6.")
+                .font(.caption).foregroundStyle(PulseColors.textMuted)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .background(PulseColors.card)
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(PulseColors.borderSubtle, lineWidth: 1))
+    }
+
     // MARK: - Small layout helpers
 
     private func labeledRow<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
@@ -236,6 +301,8 @@ struct CoachSettingsSection: View {
                 switch newProvider {
                 case .userGeminiKey:
                     store.settings.model = GeminiModel.flash35.rawValue
+                case .userOpenRouterKey:
+                    store.settings.model = OpenRouterModel.default.rawValue
                 default:
                     store.settings.model = CoachModel.gpt54.rawValue
                 }
@@ -245,6 +312,29 @@ struct CoachSettingsSection: View {
 
     private var modelBinding: Binding<String> {
         Binding(get: { store.settings.model }, set: { store.settings.model = $0 })
+    }
+
+    /// Picker selection that understands the OpenRouter "Custom…" sentinel: when
+    /// the stored model isn't a preset it reports `customModelTag` (so the menu
+    /// highlights "Custom…" and the free-text field shows the actual slug).
+    private var modelPickerBinding: Binding<String> {
+        Binding(
+            get: {
+                if store.settings.providerMode == .userOpenRouterKey {
+                    return isCustomOpenRouterModel ? customModelTag : store.settings.model
+                }
+                return store.settings.model
+            },
+            set: { newValue in
+                if newValue == customModelTag {
+                    // Switching into Custom: clear the slug only when leaving a preset
+                    // so an existing custom value is preserved.
+                    if !isCustomOpenRouterModel { store.settings.model = "" }
+                } else {
+                    store.settings.model = newValue
+                }
+            }
+        )
     }
     private var webSearchBinding: Binding<Bool> {
         Binding(get: { store.settings.enableWebSearch }, set: { store.settings.enableWebSearch = $0 })
@@ -261,6 +351,7 @@ struct CoachSettingsSection: View {
     private func refreshKeyState() {
         hasSavedKey = ((try? openAIKeyStore.readKey()) ?? nil) != nil
         hasGeminiKey = ((try? geminiKeyStore.readKey()) ?? nil) != nil
+        hasOpenRouterKey = ((try? openRouterKeyStore.readKey()) ?? nil) != nil
     }
 
     private func saveOpenAIKey() {
@@ -306,6 +397,29 @@ struct CoachSettingsSection: View {
             refreshKeyState()
         } catch {
             geminiKeyError = error.localizedDescription
+        }
+    }
+
+    private func saveOpenRouterKey() {
+        openRouterKeyError = nil
+        do {
+            try openRouterKeyStore.saveKey(openRouterKeyDraft)
+            openRouterKeyDraft = ""
+            showOpenRouterKey = false
+            refreshKeyState()
+        } catch {
+            openRouterKeyError = error.localizedDescription
+        }
+    }
+
+    private func removeOpenRouterKey() {
+        openRouterKeyError = nil
+        do {
+            try openRouterKeyStore.deleteKey()
+            openRouterKeyDraft = ""
+            refreshKeyState()
+        } catch {
+            openRouterKeyError = error.localizedDescription
         }
     }
 }
