@@ -16,6 +16,10 @@ import Foundation
 final class OpenRouterClient: ResponsesClient, @unchecked Sendable {
     private let apiKey: String
     private let model: String
+    // OpenRouter-only routing options (see `CoachSettings`). Threaded in from the
+    // resolveClient sites alongside `model`; the native clients ignore them.
+    private let privacyRouting: Bool
+    private let providerSort: String?
     private let session: URLSession
     private let endpoint = URL(string: "https://openrouter.ai/api/v1/chat/completions")!
 
@@ -24,10 +28,21 @@ final class OpenRouterClient: ResponsesClient, @unchecked Sendable {
     // Maps generated response IDs → the assistant message dict (content + tool_calls)
     // so a continuation turn can re-insert it before the matching tool results.
     private var storedAssistantMessage: [String: [String: Any]] = [:]
+    // Set in `convertTools` when the orchestrator's hosted `web_search` tool spec
+    // is seen; routes to OpenRouter's `:online` model suffix (see `onlineModelSlug`).
+    private var webSearchRequested = false
 
-    init(apiKey: String, model: String = OpenRouterModel.default.rawValue, session: URLSession = .shared) {
+    init(
+        apiKey: String,
+        model: String = OpenRouterModel.default.rawValue,
+        privacyRouting: Bool = false,
+        providerSort: String? = nil,
+        session: URLSession = .shared
+    ) {
         self.apiKey = apiKey
         self.model = model
+        self.privacyRouting = privacyRouting
+        self.providerSort = providerSort
         self.session = session
     }
 
@@ -45,6 +60,9 @@ final class OpenRouterClient: ResponsesClient, @unchecked Sendable {
         // builds (`{ "effort": "low|medium|high" }`); it's ignored for models that
         // don't reason, so forward it as-is when present.
         let reasoning = req["reasoning"]
+        // The Responses-API `text.format` carries the strict coach_response JSON
+        // schema; we translate it to Chat Completions `response_format`.
+        let textFormat = (req["text"] as? [String: Any])?["format"] as? [String: Any]
 
         if previousResponseId == nil {
             setupConversation(from: input)
@@ -52,7 +70,7 @@ final class OpenRouterClient: ResponsesClient, @unchecked Sendable {
             appendContinuation(previousId: previousResponseId!, input: input)
         }
 
-        let body = buildChatBody(tools: convertTools(tools), reasoning: reasoning)
+        let body = buildChatBody(tools: convertTools(tools), reasoning: reasoning, textFormat: textFormat)
         let bodyData = try JSONSerialization.data(withJSONObject: body, options: [.withoutEscapingSlashes])
 
         var request = URLRequest(url: endpoint)
@@ -94,6 +112,12 @@ final class OpenRouterClient: ResponsesClient, @unchecked Sendable {
                   let content = item["content"] as? String else { continue }
             messages.append(["role": chatRole(role), "content": content])
         }
+        // Unlike the native OpenAI/Gemini clients, OpenRouter sends no enforced
+        // `response_format` (several catalog models reject this app's schema), so
+        // the model isn't told the required output shape out-of-band. Inject the
+        // field spec as a system message so it can produce valid coach_response
+        // JSON from the prompt alone.
+        messages.append(["role": "system", "content": CoachResponseSchema.promptInstruction])
     }
 
     /// Subsequent turns: replay the stored assistant message for `previousId`
@@ -123,14 +147,19 @@ final class OpenRouterClient: ResponsesClient, @unchecked Sendable {
 
     /// Converts the app's flat Responses function specs
     /// (`{type, name, description, parameters}`) into Chat Completions' nested
-    /// shape (`{type: function, function: {...}}`). The OpenAI-hosted
-    /// `web_search` tool (type != "function") has no Chat Completions equivalent
-    /// and is silently dropped, matching the Gemini adapter. (OpenRouter offers web
-    /// search via a `:online` model suffix or a `plugins` entry — a future option.)
+    /// shape (`{type: function, function: {...}}`). The OpenAI-hosted `web_search`
+    /// tool (type != "function") has no Chat Completions function equivalent, so
+    /// it's dropped here and instead routed via OpenRouter's `:online` model suffix
+    /// (see `onlineModelSlug`), which works across the whole catalog and needs no
+    /// extra tool-loop round trip.
     private func convertTools(_ tools: [[String: Any]]) -> [[String: Any]] {
         tools.compactMap { tool -> [String: Any]? in
-            guard (tool["type"] as? String) == "function",
-                  let name = tool["name"] as? String else { return nil }
+            let type = tool["type"] as? String
+            if type == "web_search" || type == "web_search_preview" {
+                webSearchRequested = true
+                return nil
+            }
+            guard type == "function", let name = tool["name"] as? String else { return nil }
             var fn: [String: Any] = ["name": name]
             if let desc = tool["description"] as? String { fn["description"] = desc }
             if let params = tool["parameters"] as? [String: Any] { fn["parameters"] = params }
@@ -141,8 +170,8 @@ final class OpenRouterClient: ResponsesClient, @unchecked Sendable {
 
     // MARK: - Build request body
 
-    private func buildChatBody(tools: [[String: Any]], reasoning: Any?) -> [String: Any] {
-        var body: [String: Any] = ["model": model, "messages": cacheControlledMessages()]
+    private func buildChatBody(tools: [[String: Any]], reasoning: Any?, textFormat: [String: Any]?) -> [String: Any] {
+        var body: [String: Any] = ["model": onlineModelSlug(), "messages": cacheControlledMessages()]
 
         if !tools.isEmpty {
             // Cache the (large, static) tool block — re-sent on every round and
@@ -154,17 +183,59 @@ final class OpenRouterClient: ResponsesClient, @unchecked Sendable {
             body["tools"] = cachedTools
         }
 
-        // Deliberately NO `response_format`. OpenAI-style `json_schema` (and even
-        // `json_object`) isn't reliably accepted across OpenRouter's catalog — in
-        // particular Anthropic rejects this app's OpenAI-shaped coach_response schema
-        // (maxLength / maxItems / union-null types its structured outputs don't
-        // support), which broke the tool-less repair turn. The system prompt already
-        // demands the coach_response JSON and the orchestrator runs a 3-attempt JSON
-        // repair loop, so we let the model comply via the prompt instead.
+        // Enforce the coach_response shape via OpenRouter structured outputs
+        // (https://openrouter.ai/docs/guides/features/structured-outputs). We send
+        // `response_format` with `strict: true`, and `provider.require_parameters`
+        // (below) makes OpenRouter route only to providers that actually honor it —
+        // so models/providers that can't enforce this schema are skipped rather than
+        // silently returning prose. `promptInstruction` (a system message) remains
+        // as a belt-and-suspenders backup for models that ignore the schema.
+        if let responseFormat = chatResponseFormat(from: textFormat) {
+            body["response_format"] = responseFormat
+        }
 
         if let reasoning { body["reasoning"] = reasoning }
 
+        if let provider = providerOptions(requireParameters: body["response_format"] != nil) {
+            body["provider"] = provider
+        }
+
         return body
+    }
+
+    /// Translates the Responses-API `text.format` object
+    /// (`{type:"json_schema", name, schema, strict}`) into the Chat Completions
+    /// `response_format` shape OpenRouter expects
+    /// (`{type:"json_schema", json_schema:{name, strict, schema}}`).
+    private func chatResponseFormat(from textFormat: [String: Any]?) -> [String: Any]? {
+        guard let textFormat,
+              (textFormat["type"] as? String) == "json_schema",
+              let schema = textFormat["schema"] as? [String: Any] else { return nil }
+        var jsonSchema: [String: Any] = ["schema": schema, "strict": true]
+        if let name = textFormat["name"] as? String { jsonSchema["name"] = name }
+        return ["type": "json_schema", "json_schema": jsonSchema]
+    }
+
+    /// The model slug to send, with OpenRouter's `:online` web-search suffix
+    /// appended when the orchestrator requested web search. Not doubled if the
+    /// slug already ends in `:online` (e.g. a user-typed Custom slug).
+    private func onlineModelSlug() -> String {
+        guard webSearchRequested, !model.hasSuffix(":online") else { return model }
+        return model + ":online"
+    }
+
+    /// OpenRouter's top-level `provider` routing object, assembled from the
+    /// OpenRouter-only settings. `data_collection: "deny"` excludes providers that
+    /// log/train on prompts; `sort` biases provider selection;
+    /// `require_parameters: true` makes OpenRouter route only to providers that
+    /// honor every parameter we send (notably `response_format`), so the structured
+    /// output is actually enforced. Returns nil when nothing is set.
+    private func providerOptions(requireParameters: Bool) -> [String: Any]? {
+        var provider: [String: Any] = [:]
+        if requireParameters { provider["require_parameters"] = true }
+        if privacyRouting { provider["data_collection"] = "deny" }
+        if let sort = providerSort, !sort.isEmpty { provider["sort"] = sort }
+        return provider.isEmpty ? nil : provider
     }
 
     // MARK: - Prompt caching

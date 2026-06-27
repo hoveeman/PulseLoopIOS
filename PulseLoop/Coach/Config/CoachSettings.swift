@@ -25,9 +25,8 @@ enum CoachProviderMode: String, Codable, CaseIterable, Identifiable {
 
 /// Preset Gemini model choices surfaced in Settings.
 enum GeminiModel: String, CaseIterable, Identifiable {
-    case flash35 = "gemini-3.5-flash"
-    case pro31   = "gemini-3.1-pro-preview"
     case flash25 = "gemini-2.5-flash"
+    case flash20 = "gemini-2.0-flash"
     case pro25   = "gemini-2.5-pro"
 
     var id: String { rawValue }
@@ -36,10 +35,9 @@ enum GeminiModel: String, CaseIterable, Identifiable {
 
     var blurb: String {
         switch self {
-        case .flash35: return "Newest, most capable (default)"
-        case .pro31:   return "Advanced reasoning (preview)"
-        case .flash25: return "Fast & capable"
-        case .pro25:   return "Deep reasoning (2.5)"
+        case .flash25: return "Fast & capable (default)"
+        case .flash20: return "Previous generation"
+        case .pro25:   return "Best reasoning"
         }
     }
 }
@@ -51,13 +49,12 @@ enum GeminiModel: String, CaseIterable, Identifiable {
 /// current slug from openrouter.ai/models. These are just the curated picks.
 enum OpenRouterModel: String, CaseIterable, Identifiable {
     case claudeSonnet = "anthropic/claude-sonnet-4.6"
-    case claudeOpus   = "anthropic/claude-opus-4.8"
+    case claudeOpus   = "anthropic/claude-opus-4.7"
     case gpt55        = "openai/gpt-5.5"
     case gpt54mini    = "openai/gpt-5.4-mini"
-    case geminiFlash  = "google/gemini-3.5-flash"
-    case geminiPro    = "google/gemini-3.1-pro"
-    case llamaScout   = "meta-llama/llama-4-scout"
-    case deepseekR1   = "deepseek/deepseek-r1"
+    case geminiFlash  = "google/gemini-2.5-flash"
+    case geminiPro    = "google/gemini-2.5-pro"
+    case deepseekV4   = "deepseek/deepseek-v4"
 
     var id: String { rawValue }
 
@@ -71,8 +68,7 @@ enum OpenRouterModel: String, CaseIterable, Identifiable {
         case .gpt54mini:    return "Lower cost & latency"
         case .geminiFlash:  return "Fast & capable"
         case .geminiPro:    return "Deep reasoning"
-        case .llamaScout:   return "Open-weight, low cost"
-        case .deepseekR1:   return "Strong open reasoning"
+        case .deepseekV4:   return "Strong open reasoning, low cost"
         }
     }
 
@@ -119,6 +115,13 @@ struct CoachSettings: Codable, Equatable {
     /// Optional reasoning effort hint ("low"/"medium"/"high") when the model supports it.
     var reasoningEffort: String? = nil
     var enableWebSearch: Bool = false
+    /// OpenRouter-only: when true, route only through providers that don't log or
+    /// train on prompts (sends `provider.data_collection = "deny"`). Ignored by
+    /// the native OpenAI/Gemini clients.
+    var orEnablePrivacyRouting: Bool = false
+    /// OpenRouter-only: provider selection bias ("price" | "throughput" |
+    /// "latency"). nil = OpenRouter's default routing. Ignored by other providers.
+    var orProviderSort: String? = nil
     /// Milestone A is read-only: write/action and live-measurement tools stay off
     /// until Milestone B wires confirmation gates.
     var enableWriteTools: Bool = false
@@ -129,11 +132,6 @@ struct CoachSettings: Codable, Equatable {
     var notificationsEnabled: Bool = false
     var morningHour: Int = 8
     var eveningHour: Int = 19
-
-    /// The Gemini model to use, validated against the known presets. Falls back to
-    /// the default (`gemini-3.5-flash`) when the stored `model` isn't a recognized
-    /// Gemini model (e.g. a value left over from another provider).
-    var geminiModel: String { GeminiModel(rawValue: model)?.rawValue ?? GeminiModel.flash35.rawValue }
 
     /// The OpenRouter model slug to use. Free-form (the user may type any slug);
     /// falls back to the default only when the stored `model` is blank.
@@ -156,6 +154,8 @@ struct CoachSettings: Codable, Equatable {
         model = try c.decodeIfPresent(String.self, forKey: .model) ?? d.model
         reasoningEffort = try c.decodeIfPresent(String.self, forKey: .reasoningEffort)
         enableWebSearch = try c.decodeIfPresent(Bool.self, forKey: .enableWebSearch) ?? d.enableWebSearch
+        orEnablePrivacyRouting = try c.decodeIfPresent(Bool.self, forKey: .orEnablePrivacyRouting) ?? d.orEnablePrivacyRouting
+        orProviderSort = try c.decodeIfPresent(String.self, forKey: .orProviderSort)
         enableWriteTools = try c.decodeIfPresent(Bool.self, forKey: .enableWriteTools) ?? d.enableWriteTools
         enableLiveMeasurements = try c.decodeIfPresent(Bool.self, forKey: .enableLiveMeasurements) ?? d.enableLiveMeasurements
         maxToolCalls = try c.decodeIfPresent(Int.self, forKey: .maxToolCalls) ?? d.maxToolCalls

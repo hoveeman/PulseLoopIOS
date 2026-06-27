@@ -96,10 +96,14 @@ final class CoachNotificationService {
         switch settingsStore.settings.providerMode {
         case .userGeminiKey:
             let key = (try? geminiKeyStore.readKey()) ?? nil
-            return (key, GeminiClient(apiKey: key ?? "", model: settingsStore.settings.geminiModel))
+            return (key, GeminiClient(apiKey: key ?? ""))
         case .userOpenRouterKey:
             let key = (try? openRouterKeyStore.readKey()) ?? nil
-            return (key, OpenRouterClient(apiKey: key ?? "", model: settingsStore.settings.openRouterModel))
+            return (key, OpenRouterClient(
+                apiKey: key ?? "",
+                model: settingsStore.settings.openRouterModel,
+                privacyRouting: settingsStore.settings.orEnablePrivacyRouting,
+                providerSort: settingsStore.settings.orProviderSort))
         default:
             let key = (try? keyStore.readKey()) ?? nil
             return (key, clientFactory(key ?? ""))

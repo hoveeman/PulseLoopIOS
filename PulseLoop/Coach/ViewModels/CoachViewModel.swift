@@ -79,10 +79,14 @@ final class CoachViewModel {
         switch settingsStore.settings.providerMode {
         case .userGeminiKey:
             let key = (try? geminiKeyStore.readKey()) ?? nil
-            return (key, GeminiClient(apiKey: key ?? "", model: settingsStore.settings.geminiModel))
+            return (key, GeminiClient(apiKey: key ?? ""))
         case .userOpenRouterKey:
             let key = (try? openRouterKeyStore.readKey()) ?? nil
-            return (key, OpenRouterClient(apiKey: key ?? "", model: settingsStore.settings.openRouterModel))
+            return (key, OpenRouterClient(
+                apiKey: key ?? "",
+                model: settingsStore.settings.openRouterModel,
+                privacyRouting: settingsStore.settings.orEnablePrivacyRouting,
+                providerSort: settingsStore.settings.orProviderSort))
         default:
             let key = (try? keyStore.readKey()) ?? nil
             return (key, clientFactory(key ?? ""))
@@ -110,6 +114,22 @@ final class CoachViewModel {
     // MARK: - Persistence
 
     private func persist(_ result: CoachOrchestrator.TurnResult, conversationId: UUID, context: ModelContext) {
+        // A failed turn surfaces as a red error bubble (role "error") carrying the
+        // code + reason, instead of the generic assistant fallback.
+        if let error = result.error {
+            let errorMessage = CoachMessage(
+                conversationId: conversationId,
+                role: "error",
+                body: error.plainText,
+                cardsJSON: error.encodedJSON()
+            )
+            context.insert(errorMessage)
+            persistTrace(result.trace, messageId: errorMessage.id, conversationId: conversationId, context: context)
+            touchConversation(conversationId, context: context)
+            try? context.save()
+            return
+        }
+
         let assistant = CoachMessage(
             conversationId: conversationId,
             role: "assistant",
@@ -119,20 +139,29 @@ final class CoachViewModel {
         )
         context.insert(assistant)
 
-        for entry in result.trace {
+        persistTrace(result.trace, messageId: assistant.id, conversationId: conversationId, context: context)
+        touchConversation(conversationId, context: context)
+        try? context.save()
+    }
+
+    private func persistTrace(
+        _ trace: [CoachToolCallTrace], messageId: UUID, conversationId: UUID, context: ModelContext
+    ) {
+        for entry in trace {
             context.insert(CoachToolCall(
                 conversationId: conversationId,
-                messageId: assistant.id,
+                messageId: messageId,
                 toolName: entry.toolName,
                 inputJSON: entry.argsRedacted,
                 outputJSON: entry.resultSummary
             ))
         }
+    }
 
+    private func touchConversation(_ conversationId: UUID, context: ModelContext) {
         if let convo = fetchConversation(conversationId, context: context) {
             convo.updatedAt = Date()
         }
-        try? context.save()
     }
 
     private func recentMessages(
@@ -145,7 +174,7 @@ final class CoachViewModel {
         descriptor.fetchLimit = 40
         let rows = (try? context.fetch(descriptor)) ?? []
         return rows
-            .filter { $0.id != excludedId }
+            .filter { $0.id != excludedId && $0.role != "error" }  // never replay error bubbles to the model
             .suffix(limit)
             .map { CoachOrchestrator.PriorMessage(role: $0.role, text: $0.body) }
     }

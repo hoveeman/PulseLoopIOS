@@ -1,8 +1,5 @@
 import Foundation
 import SwiftData
-#if canImport(UIKit)
-import UIKit
-#endif
 
 enum PulseEvent: Sendable {
     case deviceStateChanged(state: RingConnectionState, address: String?)
@@ -80,10 +77,29 @@ final class EventPersistenceSubscriber {
     private let context: ModelContext
     private var task: Task<Void, Never>?
 
+    #if DEBUG
+    /// Rolling cap for the DEBUG-only raw-packet trace, and how often we prune (every Nth insert,
+    /// so we don't pay a fetch on every packet during a sync burst).
+    private let rawPacketCap = 2_000
+    private let rawPacketPruneInterval = 200
+    private var rawPacketInsertsSincePrune = 0
+    #endif
+
+    /// Coalesced-save state. During a sync the ring streams hundreds of events; saving per event
+    /// woke every `@Query` hundreds of times (the re-render storm). Instead we insert/mutate without
+    /// saving, then flush (one `save()` + one "data changed" signal) after the stream briefly idles
+    /// or a hard cap of pending writes is reached.
+    private var pendingWrites = 0
+    private var flushTask: Task<Void, Never>?
+    /// Idle window after the last event before we flush a batch.
+    private let flushDebounceNanos: UInt64 = 300_000_000   // 0.3s
+    /// Hard ceiling so a long continuous stream still flushes periodically (never unbounded latency).
+    private let flushMaxPending = 100
+
     init(context: ModelContext) {
         self.context = context
     }
-    
+
     func start() {
         guard task == nil else { return }
         task = Task {
@@ -95,27 +111,59 @@ final class EventPersistenceSubscriber {
             }
         }
     }
-    
+
     func stop() {
+        flushTask?.cancel()
+        flushNow()
         task?.cancel()
         task = nil
     }
-    
+
+    /// Persist any pending batched writes immediately. Call on app background/suspend so a sync that
+    /// is mid-batch isn't lost.
+    func flush() {
+        flushNow()
+    }
+
     func persist(_ event: PulseEvent) {
+        applyPersist(event)
+        scheduleFlush()
+    }
+
+    /// Debounced batch flush: reset the idle timer each event; flush immediately if too many writes
+    /// have piled up. Coalesces a sync burst into a handful of saves + change signals.
+    private func scheduleFlush() {
+        pendingWrites += 1
+        if pendingWrites >= flushMaxPending {
+            flushNow()
+            return
+        }
+        flushTask?.cancel()
+        flushTask = Task { [weak self] in
+            let nanos = self?.flushDebounceNanos ?? 300_000_000
+            try? await Task.sleep(nanoseconds: nanos)
+            guard let self, !Task.isCancelled else { return }
+            self.flushNow()
+        }
+    }
+
+    /// Persist the accumulated batch and notify observers exactly once.
+    private func flushNow() {
+        flushTask?.cancel()
+        flushTask = nil
+        guard pendingWrites > 0 else { return }
+        pendingWrites = 0
         #if canImport(UIKit)
-        let bgTask = UIApplication.shared.beginBackgroundTask(withName: "PulseEventPersistence") {
-            // Task expired
-        }
+        // Guard against being suspended mid-save when the debounce timer fires in the background.
+        let bgTask = UIApplication.shared.beginBackgroundTask(withName: "PulseEventBatchFlush") {}
+        defer { if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask) } }
         #endif
+        try? context.save()
+        // One coalesced signal per batch; stores recompute once instead of per event.
+        PulseDataChange.shared.notify()
+    }
 
-        defer {
-            #if canImport(UIKit)
-            if bgTask != .invalid {
-                UIApplication.shared.endBackgroundTask(bgTask)
-            }
-            #endif
-        }
-
+    private func applyPersist(_ event: PulseEvent) {
         switch event {
         case let .deviceStateChanged(state, address):
             let device = MetricsService.fetchDevices(context).first ?? Device()
@@ -149,6 +197,13 @@ final class EventPersistenceSubscriber {
                     confidence: decoded.confidence
                 )
             )
+            // Keep the debug trace a rolling window so it can't grow without bound. Prune only
+            // every Nth insert to avoid a fetch on every packet during a sync burst.
+            rawPacketInsertsSincePrune += 1
+            if rawPacketInsertsSincePrune >= rawPacketPruneInterval {
+                rawPacketInsertsSincePrune = 0
+                DebugRepository.pruneRawPackets(maxRows: rawPacketCap, context: context)
+            }
             #endif
         case let .derivedUpdate(kind, entityType, entityId, payloadJSON):
             context.insert(DerivedUpdateRow(kind: kind, entityType: entityType, entityId: entityId, payloadJSON: payloadJSON))
@@ -161,7 +216,7 @@ final class EventPersistenceSubscriber {
                     calories: calories,
                     distanceMeters: distanceMeters,
                     source: "live",
-                    syncedAt: nil
+                    syncedAt: Date()
                 ),
                 context: context
             )
@@ -171,36 +226,28 @@ final class EventPersistenceSubscriber {
                 entityId: row.id.uuidString,
                 payloadJSON: #"{"steps":\#(row.steps),"calories":\#(Int(row.calories)),"distance_m":\#(Int(row.distanceMeters))}"#
             ))
-            HealthSyncService.shared.triggerAutomaticSync(context: context)
         case let .activityBucket(timestamp, steps, distanceMeters):
             // Per-quarter-hour ring history: upserted by timestamp + the day total recomputed as the
             // sum of distinct buckets, so re-syncs are idempotent (no drift). Calories omitted.
             ActivityService.applyActivityBucket(date: timestamp, steps: steps, distanceMeters: distanceMeters, context: context)
-            HealthSyncService.shared.triggerAutomaticSync(context: context)
         case .activitySyncReset:
             // No longer needed — bucket upsert-by-timestamp makes re-syncs idempotent on its own.
             // Kept as a no-op so the (still-published) event doesn't fall through to `unknown`.
             break
         case let .heartRateSample(bpm, timestamp):
             persistMeasurement(kind: .heartRate, value: Double(bpm), timestamp: timestamp, source: .live, kindLabel: "hr_sample")
-            HealthSyncService.shared.triggerAutomaticSync(context: context)
         case let .spo2Result(value, timestamp):
             persistMeasurement(kind: .spo2, value: Double(value), timestamp: timestamp, source: .live, kindLabel: "spo2_result")
-            HealthSyncService.shared.triggerAutomaticSync(context: context)
         case let .historyMeasurement(kind, value, timestamp):
             persistMeasurement(kind: kind, value: value, timestamp: timestamp, source: .history, kindLabel: "history_measurement")
-            HealthSyncService.shared.triggerAutomaticSync(context: context)
         case let .stressSample(value, timestamp):
             persistMeasurement(kind: .stress, value: Double(value), timestamp: timestamp, source: .colmi, kindLabel: "stress_sample")
         case let .hrvSample(value, timestamp):
             persistMeasurement(kind: .hrv, value: Double(value), timestamp: timestamp, source: .colmi, kindLabel: "hrv_sample")
-            HealthSyncService.shared.triggerAutomaticSync(context: context)
         case let .temperatureSample(celsius, timestamp):
             persistMeasurement(kind: .temperature, value: celsius, timestamp: timestamp, source: .colmi, kindLabel: "temperature_sample")
-            HealthSyncService.shared.triggerAutomaticSync(context: context)
         case let .sleepTimeline(timestamp, stages):
             persistSleepTimeline(start: timestamp, stages: stages)
-            HealthSyncService.shared.triggerAutomaticSync(context: context)
         case let .gpsPoint(sessionId, latitude, longitude, altitude, horizontalAccuracy, speed, course, accepted, rejectionReason, timestamp):
             context.insert(ActivityGpsPoint(
                 sessionId: sessionId,
@@ -225,29 +272,14 @@ final class EventPersistenceSubscriber {
         case .heartRateComplete, .spo2Progress, .spo2Complete, .syncProgress, .workoutStarted, .workoutPaused, .workoutResumed, .workoutFinished, .coachTrace:
             break
         }
-        try? context.save()
+        // NB: no per-event save here — `scheduleFlush()` (called by `persist`) batches the save.
     }
     
+    /// Persist one live/history measurement, record a derived-update audit row, and link it to
+    /// an in-progress workout if one is recording. Mirrors `persistence._on_hr_sample`.
     private func persistMeasurement(kind: MeasurementKind, value: Double, timestamp: Date, source: MeasurementSource, kindLabel: String) {
-        let kindRaw = kind.rawValue
-        let descriptor = FetchDescriptor<Measurement>(
-            predicate: #Predicate<Measurement> { $0.kindRaw == kindRaw && $0.timestamp == timestamp }
-        )
-        let existing = (try? context.fetch(descriptor))?.first
-        
-        let row: Measurement
-        if let existing {
-            row = existing
-            if existing.value != value || existing.sourceRaw != source.rawValue {
-                existing.value = value
-                existing.sourceRaw = source.rawValue
-                existing.syncedAt = nil // Reset sync status so it pushes the updated value to HealthKit
-            }
-        } else {
-            row = Measurement(kind: kind, value: value, unit: kind.unit, timestamp: timestamp, source: source)
-            context.insert(row)
-        }
-        
+        let row = Measurement(kind: kind, value: value, unit: kind.unit, timestamp: timestamp, source: source)
+        context.insert(row)
         context.insert(DerivedUpdateRow(kind: kindLabel, entityType: "measurement", entityId: row.id.uuidString))
         _ = ActivityRecorderService.linkSample(
             kind: kind,
@@ -260,22 +292,13 @@ final class EventPersistenceSubscriber {
         )
     }
 
-
     /// Upsert a sleep session by night, appending this packet's per-minute stage blocks and
     /// recomputing session bounds. The ring streams ~20 timeline packets (15 samples each) per
     /// night, so blocks must accumulate into one session rather than spawning a session per
     /// packet. Mirrors `persistence._on_sleep_timeline`.
     private func persistSleepTimeline(start: Date, stages: [SleepStage]) {
         let calendar = Calendar.current
-        
-        // Group packets using a noon-to-noon boundary (standard for sleep tracking).
-        // Sleep starting at or after 12:00 PM (noon) belongs to the next day's waking morning.
-        let hour = calendar.component(.hour, from: start)
-        let wakingDay = hour >= 12
-            ? calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: start)) ?? start
-            : calendar.startOfDay(for: start)
-        let dateKey = calendar.startOfDay(for: wakingDay)
-
+        let dateKey = calendar.startOfDay(for: start)
         let allSessions = (try? context.fetch(FetchDescriptor<SleepSession>())) ?? []
         let session = allSessions.first { calendar.isDate($0.date, inSameDayAs: dateKey) }
             ?? {
