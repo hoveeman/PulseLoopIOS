@@ -22,6 +22,10 @@ struct PrivacyDataSettingsView: View {
                     diagnosticsURL = DiagnosticsExporter.exportFile(context: modelContext)
                 }
 
+                // DEBUG-only: both actions call `SeedData.clearAll`, which deletes every row of
+                // every model — real data and demo alike. Keeping them out of Release/TestFlight
+                // builds removes the only in-app path that can wipe a real user's data.
+                #if DEBUG
                 SectionHeader(title: "Demo data", action: nil)
                 SecondaryButton(title: "Clear demo data", systemImage: "trash") {
                     SeedData.clearAll(modelContext)
@@ -35,6 +39,7 @@ struct PrivacyDataSettingsView: View {
                     SeedData.clearAll(modelContext)
                     SeedData.seedDemo(modelContext, completeOnboarding: true)
                 }
+                #endif
             }
             .padding()
         }
