@@ -22,10 +22,16 @@ struct RootAppView: View {
             // Demo data is opt-in: load it from Settings → "Reseed demo data", or via the
             // `-seedDemo YES` launch arg (test tooling only). Normal launches start empty.
             .task {
+                #if DEBUG
+                // DEBUG-only: this `clearAll` destroys all real user data. Gating it behind
+                // DEBUG guarantees a Release/TestFlight build can never wipe the store from a
+                // stray `seedDemo` default — a clean checkout still works, but archived builds
+                // are safe regardless of working-tree/UserDefaults state.
                 if UserDefaults.standard.bool(forKey: "seedDemo") {
                     SeedData.clearAll(modelContext)
                     SeedData.seedDemo(modelContext, completeOnboarding: true)
                 }
+                #endif
                 // Test tooling: deep-link straight to a seeded workout's detail (route map).
                 if UserDefaults.standard.bool(forKey: "openWorkout"),
                    let session = ActivityRepository.sessions(context: modelContext).first(where: { $0.status == .finished && $0.useGps }) {

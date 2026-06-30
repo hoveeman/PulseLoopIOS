@@ -4,6 +4,8 @@
 <dict>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
+	<key>NSCameraUsageDescription</key>
+	<string>Attach a photo to ask the AI Coach about it.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>location</string>
@@ -14,6 +16,7 @@
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
 		<string>com.pulseloop.coach.refresh</string>
+		<string>com.pulseloop.coach.process</string>
 	</array>
 </dict>
 </plist>
