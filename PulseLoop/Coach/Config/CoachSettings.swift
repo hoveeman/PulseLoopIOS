@@ -5,6 +5,7 @@ import Foundation
 /// and is treated as disabled until implemented.
 enum CoachProviderMode: String, Codable, CaseIterable, Identifiable {
     case offlineStub
+    case appleOnDevice
     case userOpenAIKey
     case userGeminiKey
     case userOpenRouterKey
@@ -15,6 +16,7 @@ enum CoachProviderMode: String, Codable, CaseIterable, Identifiable {
     var label: String {
         switch self {
         case .offlineStub: return "Offline"
+        case .appleOnDevice: return "On-device (Apple)"
         case .userOpenAIKey: return "OpenAI (your key)"
         case .userGeminiKey: return "Gemini (your key)"
         case .userOpenRouterKey: return "OpenRouter (your key)"
@@ -126,12 +128,20 @@ struct CoachSettings: Codable, Equatable {
     /// until Milestone B wires confirmation gates.
     var enableWriteTools: Bool = false
     var enableLiveMeasurements: Bool = false
+    /// When true, the coach composer shows a camera/photo button so the user can
+    /// attach an image to a message (multimodal input). Off by default.
+    var enableImageInput: Bool = false
     var maxToolCalls: Int = 8
     var maxRounds: Int = 4
     // Milestone D — automated daily check-in notifications.
     var notificationsEnabled: Bool = false
     var morningHour: Int = 8
+    var middayHour: Int = 13
     var eveningHour: Int = 19
+    /// Proactive, event-driven anomaly alerts (resting-HR drift, low SpO₂, poor
+    /// sleep). On-device only — free/unlimited local inference makes "watch the
+    /// stream and speak up when something looks off" practical. Off by default.
+    var proactiveAlertsEnabled: Bool = false
 
     /// The OpenRouter model slug to use. Free-form (the user may type any slug);
     /// falls back to the default only when the stored `model` is blank.
@@ -158,11 +168,14 @@ struct CoachSettings: Codable, Equatable {
         orProviderSort = try c.decodeIfPresent(String.self, forKey: .orProviderSort)
         enableWriteTools = try c.decodeIfPresent(Bool.self, forKey: .enableWriteTools) ?? d.enableWriteTools
         enableLiveMeasurements = try c.decodeIfPresent(Bool.self, forKey: .enableLiveMeasurements) ?? d.enableLiveMeasurements
+        enableImageInput = try c.decodeIfPresent(Bool.self, forKey: .enableImageInput) ?? d.enableImageInput
         maxToolCalls = try c.decodeIfPresent(Int.self, forKey: .maxToolCalls) ?? d.maxToolCalls
         maxRounds = try c.decodeIfPresent(Int.self, forKey: .maxRounds) ?? d.maxRounds
         notificationsEnabled = try c.decodeIfPresent(Bool.self, forKey: .notificationsEnabled) ?? d.notificationsEnabled
         morningHour = try c.decodeIfPresent(Int.self, forKey: .morningHour) ?? d.morningHour
+        middayHour = try c.decodeIfPresent(Int.self, forKey: .middayHour) ?? d.middayHour
         eveningHour = try c.decodeIfPresent(Int.self, forKey: .eveningHour) ?? d.eveningHour
+        proactiveAlertsEnabled = try c.decodeIfPresent(Bool.self, forKey: .proactiveAlertsEnabled) ?? d.proactiveAlertsEnabled
     }
 }
 
