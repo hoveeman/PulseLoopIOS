@@ -1,5 +1,8 @@
 import Foundation
 import SwiftData
+#if canImport(UIKit)
+import UIKit
+#endif
 
 enum PulseEvent: Sendable {
     case deviceStateChanged(state: RingConnectionState, address: String?)
